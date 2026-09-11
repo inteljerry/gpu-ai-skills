@@ -34,7 +34,9 @@ Ask for or infer:
   (see "Measure VRAM first" below) instead of asking the user
 - runtime: `vllm`, `sglang`, or `torch`
 - quantization: `bf16`, `fp16`, `fp8`, `int8`, `int4`, `int3`, `int2`,
-  or `mxfp4`
+  `mxfp4`, or `fp4` -- but for an already-quantized checkpoint, prefer
+  omitting `--quant` so the config's own dtypes are used (see
+  "Pre-Quantized Checkpoints")
 - context length and concurrency
 - tensor parallel degree if multiple XPUs are planned
 - vLLM `--gpu-memory-utilization` value if this is launch planning
@@ -167,6 +169,34 @@ If quantization is omitted, the script auto-detects known
 quantized weights, the script auto-pairs KV dtype with `fp8` unless the
 user overrides `--kv-dtype`.
 
+## Pre-Quantized Checkpoints
+
+For a checkpoint that ships quantized, **omit `--quant`** and let the
+config drive the dtypes. `quant_method` is not always the whole story:
+some MoE models give their experts a separate `expert_dtype`, and the
+experts are almost all of the model.
+
+DeepSeek-V4-Flash is the case to remember -- `quant_method: fp8` with
+`expert_dtype: fp4`, so 278 B of its 291 B params are 4-bit. Pricing it
+all at fp8 doubles the weight estimate and turns a real 8-XPU FITS into
+DOES NOT FIT.
+
+The script handles this automatically whenever the requested dtype still
+matches the config -- auto-detected, or typed explicitly as the same
+dtype. `--quant fp8` on a checkpoint whose `quant_method` is already fp8
+keeps the fp4 experts.
+
+Naming a *different* dtype (`--quant bf16`) is a re-quantization
+hypothetical the config no longer describes, so the expert split is
+suppressed. The output labels that line `hypothetical:` and quotes what
+the as-shipped weights would be, so the larger number cannot be mistaken
+for the checkpoint's real size. Always read the `Expert weights:` line
+and report which dtype landed on the experts.
+
+For fp4 weights, also state the kernel caveat from
+`references/runtime-caveats.md`: fitting the bytes is not the same as the
+runtime keeping them 4-bit on Battlemage.
+
 Tensor parallelism divides weights and KV cache per device in this
 estimator, and `--device-vram-gb` is per device. The script does not know
 which cards the launch will land on, so confirm N XPUs exist with
@@ -201,12 +231,24 @@ devices in the answer via `ZE_AFFINITY_MASK`.
   throughput. Use benchmark/profile skills for measured behavior.
 - Match `--gpu-memory-utilization` to the planned runtime launch; the
   default `1.0` is only a physical-fit answer.
-- Report auto-detected quantization and KV dtype so the user knows which
+- Report auto-detected quantization and KV dtype -- including the
+  `Expert weights:` line for MoE models -- so the user knows which
   assumptions drove the verdict.
+- Use `--quant` only to ask a "what if I re-quantized this" question. To
+  price a checkpoint as shipped, omit it. Naming a dtype that differs from
+  the config's suppresses `expert_dtype` and can nearly double the weight
+  estimate for models like DeepSeek-V4-Flash; the output says
+  `hypothetical:` when that happens, so do not report such a run as the
+  model's real footprint.
+- Sanity-check a surprising weight estimate against the repo's actual
+  size before reporting it. The Hub API gives it without downloading:
+  `curl -s "https://huggingface.co/api/models/<id>?blobs=true"` and sum
+  the root-level `*.safetensors` sizes. A large gap means a modeling gap
+  -- fix the script and add a fixture, do not paper over it in prose.
 - Route diffusion fit and tight VLM image-memory questions to empirical
   checks instead of treating this estimate as complete.
 
 ## References
 
-- Read `references/coverage-and-formulas.md` when checking model class support, formula details, MoE/head-dim behavior, mixed precision, quick-reference verdicts on Arc Pro B70, or why an estimate differs from another calculator.
-- Read `references/runtime-caveats.md` when planning dtype/KV choices, handling VLM or diffusion edge cases, or explaining what this skill intentionally does not predict.
+- Read `references/coverage-and-formulas.md` when checking model class support, formula details, MoE/head-dim behavior, mixed precision, `expert_dtype`, validation numbers, quick-reference verdicts on Arc Pro B70, or why an estimate differs from another calculator.
+- Read `references/runtime-caveats.md` when planning dtype/KV choices, weighing fp4 kernel support on Battlemage, handling VLM or diffusion edge cases, or explaining what this skill intentionally does not predict.

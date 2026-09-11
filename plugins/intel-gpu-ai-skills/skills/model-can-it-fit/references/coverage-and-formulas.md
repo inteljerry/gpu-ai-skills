@@ -11,6 +11,7 @@ is covered.
 | Decoder-only LLMs such as Qwen, Llama, Mistral, and Gemma text models | Full estimate | About 5% |
 | MoE models such as Qwen3-MoE, Mixtral, and DeepSeek-V3 | Full estimate, including shared experts | About 10% |
 | Hybrid MoE models such as DeepSeek-V2/V3/V4 and Mistral-Large-3 | Counts dense and MoE layers separately via `first_k_dense_replace` | About 10% |
+| MoE with a separate expert dtype such as DeepSeek-V4-Flash | Prices expert FFNs at `expert_dtype`, the rest at `quant_method` | About 5% |
 | VLMs such as Qwen2-VL, Gemma-3 vision, LLaVA, and Nemotron-Omni | Adds vision tower and supports `text_config` or `llm_config` | Weights are exact; runtime caveats apply |
 | Mistral `params.json` models | Reads `params.json` when `config.json` is absent | About 10% |
 | Diffusion models | Refuses as a full estimate | Use empirical benchmarking |
@@ -78,10 +79,23 @@ Runtime framework overhead is a floor estimate:
 | `int3` | 0.42 |
 | `int2` | 0.30 |
 | `mxfp4` | 0.55 |
+| `fp4` | 0.55 |
 
 `int4` includes typical scale and zero overhead for grouped
 quantization with group size 128. KV dtype bytes are 2 for `bf16` and
 `fp16`, and 1 for `fp8` or `int8`.
+
+`fp4` covers NVFP4 and DeepSeek-V4's `expert_dtype: fp4`. The 0.55 figure
+is deliberately conservative: DeepSeek-V4-Flash measures 0.531 effective
+bytes per param (4 bits of weight plus one `ue8m0` scale byte per 32
+weights), so the estimate runs ~4% heavy rather than light.
+
+Any dtype narrower than 16-bit auto-pairs KV with `fp8`. That set is
+derived from this table (`SUB16_QUANTS`), not hardcoded, so adding a row
+here cannot leave a new dtype defaulting to `bf16` KV.
+
+`quant_method` spellings are normalized before lookup:
+`nvfp4`/`modelopt_fp4` to `fp4`, `awq`/`gptq` to `int4`.
 
 ## Important Modeling Details
 
@@ -93,10 +107,41 @@ For MoE models, prefer `moe_intermediate_size`, `expert_hidden_dim`, or
 the equivalent MoE-specific FFN field over dense `intermediate_size`.
 Shared experts are always active in addition to routed experts.
 
-For mixed-precision quantized models, inspect
-`quantization_config.modules_to_not_convert`. The script keeps
-recognized embeddings, attention, or router modules at full precision
-and prints a component-level weight breakdown.
+## Mixed And Per-Component Precision
+
+A checkpoint's weights are often not all one dtype. Two independent
+config mechanisms express that, and a model may use both:
+
+**1. `quantization_config.modules_to_not_convert`** (e.g.
+openai/gpt-oss-20b) names components held at full precision while the
+rest is quantized. The script recognizes embeddings, attention, and
+router entries.
+
+**2. A separate `expert_dtype`** (e.g. deepseek-ai/DeepSeek-V4-Flash)
+gives the MoE expert FFNs their own dtype. DeepSeek-V4-Flash declares
+`quantization_config.quant_method: fp8` *and* `expert_dtype: fp4`: only
+the ~12 B non-expert params are fp8, while the 278 B of experts are 4-bit.
+
+Reading `quant_method` alone and applying it uniformly prices 96% of that
+model at double its real size -- 270.9 GiB of "weights" against 148.7 GiB
+of actual safetensors -- which is enough to flip an 8-XPU verdict from
+FITS to DOES NOT FIT. Always report which dtype landed on the experts.
+
+Either way the script prints a component-level weight breakdown. With
+`expert_dtype`, the rows are embeddings at `bf16`, non-expert weights at
+`quant_method`, and expert FFNs at `expert_dtype`.
+
+`expert_dtype` applies **whenever the requested weight dtype still matches
+the config** -- auto-detected, or typed explicitly as the same dtype.
+`--quant fp8` against a `quant_method: fp8` checkpoint keeps its fp4
+experts, because that argument restates the config rather than overriding
+it.
+
+Only a *differing* `--quant` suppresses the split, since it posits a
+uniform re-quantization the config no longer describes. That case prints
+`hypothetical:` on the `Expert weights:` line along with the as-shipped
+weight figure for comparison, so a re-quantization estimate cannot be
+misread as the checkpoint's real size.
 
 ## Tested Model Families
 
@@ -104,8 +149,38 @@ Dense coverage includes Qwen2.5, Llama 3.1/3.3, Gemma-2, and
 Nemotron-70B style configs.
 
 MoE coverage includes Qwen3-30B-A3B, Qwen3-235B-A22B, Mixtral,
-DeepSeek-V3/V4-style hybrid MoE, and Mistral-Large-3 style
-`params.json` configs.
+DeepSeek-V3/V4-style hybrid MoE, DeepSeek-V4-Flash (fp8 + fp4 experts),
+and Mistral-Large-3 style `params.json` configs.
 
 Multimodal coverage includes Qwen2-VL, Gemma vision configs, LLaVA-like
 configs, and Nemotron-Omni style `llm_config` layouts.
+
+## Validation
+
+Weight estimates are checked against the real root-level safetensors byte
+totals of each repo -- the only ground truth available without
+downloading the models:
+
+| Model | Estimate | On disk | Error |
+|---|---:|---:|---:|
+| Qwen2.5-7B-Instruct (bf16) | 14.19 GiB | 14.19 GiB | +0.0% |
+| Qwen3-30B-A3B (bf16 MoE) | 56.85 GiB | 56.87 GiB | -0.0% |
+| gpt-oss-20b (mxfp4 experts) | 13.13 GiB | 12.82 GiB | +2.4% |
+| DeepSeek-V4-Flash (fp8 + fp4 experts) | 155.35 GiB | 148.66 GiB | +4.5% |
+
+Reproduce a row by summing the repo's root-level `*.safetensors` sizes
+from `https://huggingface.co/api/models/<id>?blobs=true` and comparing
+against the script's `Weights` line at `--tp 1`. Count root level only:
+some repos ship a duplicate copy in a subdirectory (gpt-oss-20b has
+`original/`), which doubles a naive sum.
+
+The regression suite lives at the repo root and covers dimension
+parsing, KV ground truth, and verdicts:
+
+```sh
+python3 -m pytest tests/test_fit.py -q
+```
+
+It does not yet assert the mixed-precision paths above -- there is no
+`expert_dtype` case in it. Add one there, using its pinned-revision
+config fetch, rather than hand-computing a weight figure in an answer.

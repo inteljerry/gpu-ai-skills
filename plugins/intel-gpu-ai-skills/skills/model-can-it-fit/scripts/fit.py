@@ -33,11 +33,33 @@ BYTES_PER_PARAM = {
     "int3":  0.42,
     "int2":  0.30,
     "mxfp4": 0.55,
+    # 4-bit float with block scales: NVFP4, and DeepSeek-V4's
+    # `expert_dtype: fp4`. DeepSeek-V4-Flash measures 0.531 B/param
+    # effective (4 bits + one ue8m0 scale byte per 32 weights), so 0.55 is
+    # deliberately ~4% conservative and matches the mxfp4 row.
+    "fp4":   0.55,
 }
 
 BYTES_PER_KV = {
     "bf16": 2.0, "fp16": 2.0, "fp8": 1.0, "int8": 1.0,
 }
+
+# quantization_config.quant_method spellings that mean a dtype we price
+# above. Keys are lowercase quant_method values as they appear in configs.
+QUANT_METHOD_ALIASES = {
+    "nvfp4":   "fp4",
+    "fp4":     "fp4",
+    "modelopt_fp4": "fp4",
+    "awq":     "int4",
+    "gptq":    "int4",
+}
+
+# Anything narrower than 16-bit weights should default to fp8 KV rather
+# than bf16; derived from the table so a new dtype cannot be forgotten
+# here the way `fp4` was.
+SUB16_QUANTS = frozenset(
+    q for q, bpp in BYTES_PER_PARAM.items() if bpp < 2.0
+)
 
 # Empirical floors on Arc Pro B70.
 FRAMEWORK_OVERHEAD_GB = {
@@ -405,12 +427,52 @@ def fmt_gb(b: int) -> str:
     return f"{b / GB:6.2f} GB"
 
 
+def expert_dtype_of(cfg: dict) -> str | None:
+    """Weight dtype declared for MoE expert tensors, independent of the
+    repo-wide quant_method. Returns None if absent or unpriced.
+
+    DeepSeek-V4 ships `quantization_config.quant_method: fp8` alongside a
+    top-level `expert_dtype: fp4`: only the expert FFNs are 4-bit, everything
+    else is fp8. Reading quant_method alone prices ~96% of the model at
+    double its real size -- for DeepSeek-V4-Flash that is 290.89 GB of
+    "weights" against 159.6 GB of actual safetensors.
+    """
+    text_cfg = cfg.get("text_config", {})
+    raw = cfg.get("expert_dtype") or text_cfg.get("expert_dtype")
+    if not raw:
+        return None
+    dtype = str(raw).lower()
+    return QUANT_METHOD_ALIASES.get(dtype, dtype) if (
+        dtype in BYTES_PER_PARAM or dtype in QUANT_METHOD_ALIASES) else None
+
+
+def expert_params(d: ModelDims) -> int:
+    """Routed + shared expert FFN params -- the tensors `expert_dtype` covers.
+
+    Mirrors the MoE branch of count_params(), so the remainder
+    (params - expert_params) is exactly the non-expert weights.
+    """
+    if not d.is_moe:
+        return 0
+    moe_layers = d.num_layers
+    if d.first_k_dense_replace > 0 and d.dense_intermediate > 0:
+        moe_layers -= d.first_k_dense_replace
+    per_layer = (d.num_experts + d.num_shared_experts) * 3 * d.hidden * d.intermediate
+    return moe_layers * per_layer
+
+
 def calculate_mixed_precision_weights(cfg: dict, d: ModelDims, params: int,
-                                       quant: str, tp: int) -> tuple[int, dict | None]:
+                                       quant: str, tp: int,
+                                       expert_dtype: str | None = None
+                                       ) -> tuple[int, dict | None]:
     """Calculate weight bytes accounting for mixed-precision quantization.
 
-    Some models (e.g., openai/gpt-oss-20b) use quantization_config.modules_to_not_convert
-    to keep certain components at full precision while quantizing others.
+    Two independent mechanisms, and a model may use both:
+
+    - `quantization_config.modules_to_not_convert` (e.g. openai/gpt-oss-20b)
+      keeps named components at full precision while quantizing the rest.
+    - a separate `expert_dtype` for the MoE FFNs (e.g. DeepSeek-V4), passed
+      in by the caller so an explicit --quant can suppress it.
 
     Returns:
         (weights_bytes, breakdown_dict or None)
@@ -418,18 +480,50 @@ def calculate_mixed_precision_weights(cfg: dict, d: ModelDims, params: int,
     qcfg = cfg.get("quantization_config", {})
     modules_to_not_convert = qcfg.get("modules_to_not_convert", [])
 
-    # If no selective quantization, use uniform quantization
+    e_params = expert_params(d) if expert_dtype else 0
+    e_bpp = BYTES_PER_PARAM[expert_dtype] if e_params else BYTES_PER_PARAM[quant]
+
+    def uniform_or_expert_split() -> tuple[int, dict | None]:
+        """No usable modules_to_not_convert: either a flat dtype for
+        everything, or experts split out at their own dtype."""
+        if not e_params:
+            return int(params * BYTES_PER_PARAM[quant] / tp), None
+        # Experts at their own dtype, everything else at `quant`. Embeddings
+        # stay bf16, the convention every quantizer here follows.
+        embed_p = d.vocab * d.hidden * (1 if d.tied else 2)
+        rest_p = max(params - e_params - embed_p, 0)
+        embed_bytes = embed_p * BYTES_PER_PARAM["bf16"]
+        rest_bytes = rest_p * BYTES_PER_PARAM[quant]
+        e_bytes = e_params * e_bpp
+        breakdown = {
+            "embed_params": embed_p,
+            "embed_bytes": int(embed_bytes / tp),
+            "embed_bpp": BYTES_PER_PARAM["bf16"],
+            "attn_params": rest_p,
+            "attn_bytes": int(rest_bytes / tp),
+            "attn_bpp": BYTES_PER_PARAM[quant],
+            "attn_label": "Non-expert",
+            "router_params": 0,
+            "router_bytes": 0,
+            "router_bpp": BYTES_PER_PARAM[quant],
+            "ffn_params": e_params,
+            "ffn_bytes": int(e_bytes / tp),
+            "ffn_bpp": e_bpp,
+        }
+        return int((embed_bytes + rest_bytes + e_bytes) / tp), breakdown
+
     if not modules_to_not_convert:
-        return int(params * BYTES_PER_PARAM[quant] / tp), None
+        return uniform_or_expert_split()
 
     # Parse which modules to keep at full precision
     keep_embeddings = any("embed" in m or "lm_head" in m for m in modules_to_not_convert)
     keep_attn = any("attn" in m for m in modules_to_not_convert)
     keep_router = any("router" in m for m in modules_to_not_convert)
 
-    # If not selectively quantizing recognizable components, fall back to uniform
+    # If not selectively quantizing recognizable components, fall back to
+    # uniform (still honoring a separate expert dtype if one was passed)
     if not (keep_embeddings or keep_attn):
-        return int(params * BYTES_PER_PARAM[quant] / tp), None
+        return uniform_or_expert_split()
 
     # Calculate component sizes
     h = d.hidden
@@ -466,7 +560,10 @@ def calculate_mixed_precision_weights(cfg: dict, d: ModelDims, params: int,
     embed_bytes = embed_params * (bf16_bpp if keep_embeddings else quant_bpp)
     attn_bytes = attn_params * (bf16_bpp if keep_attn else quant_bpp)
     router_bytes = router_params * (bf16_bpp if keep_router else quant_bpp)
-    ffn_bytes = ffn_params * quant_bpp
+    # Experts carry their own dtype when the config declares one; any dense
+    # FFN left over (hybrid MoE) stays at `quant`.
+    dense_ffn_params = max(ffn_params - e_params, 0)
+    ffn_bytes = e_params * e_bpp + dense_ffn_params * quant_bpp
     vision_bytes = d.vision_params * (bf16_bpp if keep_embeddings else quant_bpp)
 
     total_bytes = int((embed_bytes + attn_bytes + router_bytes + ffn_bytes + vision_bytes) / tp)
@@ -483,7 +580,8 @@ def calculate_mixed_precision_weights(cfg: dict, d: ModelDims, params: int,
         "router_bpp": bf16_bpp if keep_router else quant_bpp,
         "ffn_params": ffn_params,
         "ffn_bytes": int(ffn_bytes / tp),
-        "ffn_bpp": quant_bpp,
+        # Blended when experts and leftover dense FFN differ in dtype.
+        "ffn_bpp": ffn_bytes / ffn_params if ffn_params else quant_bpp,
     }
 
     return total_bytes, breakdown
@@ -491,12 +589,14 @@ def calculate_mixed_precision_weights(cfg: dict, d: ModelDims, params: int,
 
 def estimate(cfg: dict, quant: str, kv_dtype: str, ctx: int,
              concurrency: int, tp: int, runtime: str,
-             device_vram_gb: float, gpu_memory_utilization: float = 1.0) -> dict:
+             device_vram_gb: float, gpu_memory_utilization: float = 1.0,
+             expert_dtype: str | None = None) -> dict:
     d = parse_dims(cfg)
     params = count_params(d) + d.vision_params
 
     # Calculate weights with mixed-precision support
-    weights, mixed_breakdown = calculate_mixed_precision_weights(cfg, d, params, quant, tp)
+    weights, mixed_breakdown = calculate_mixed_precision_weights(
+        cfg, d, params, quant, tp, expert_dtype)
 
     # KV cache is sharded by attention heads (divided by TP)
     # Each GPU stores KV cache only for its subset of heads
@@ -534,6 +634,7 @@ def estimate(cfg: dict, quant: str, kv_dtype: str, ctx: int,
         "max_concurrency": int(max_concurrency),
         "max_context": int(max_context),
         "mixed_breakdown": mixed_breakdown,
+        "expert_dtype": expert_dtype,
     }
 
 
@@ -609,13 +710,15 @@ def parse_tp_sweep(value: str | None) -> list[int]:
     return sorted(out)
 
 
-def print_tp_sweep(cfg: dict, args: argparse.Namespace, tp_values: list[int]) -> None:
+def print_tp_sweep(cfg: dict, args: argparse.Namespace, tp_values: list[int],
+                   expert_dtype: str | None = None) -> None:
     rows = []
     first_fit = None
     for tp in tp_values:
         result = estimate(cfg, args.quant, args.kv_dtype, args.ctx,
                           args.concurrency, tp, args.runtime,
-                          args.device_vram_gb, args.gpu_memory_utilization)
+                          args.device_vram_gb, args.gpu_memory_utilization,
+                          expert_dtype)
         rows.append((
             tp,
             result["weights"],
@@ -710,22 +813,32 @@ def main(argv: list[str] | None = None) -> int:
     cfg = fetch_config(args.model, args.revision)
 
     # Auto-detect pre-quantized models from config if --quant not specified
+    config_quant = cfg.get("quantization_config", {}).get("quant_method", "").lower()
+    config_quant = QUANT_METHOD_ALIASES.get(config_quant, config_quant)
+    if config_quant not in BYTES_PER_PARAM:
+        config_quant = None
     auto_quant = False
     if args.quant is None:
-        qcfg = cfg.get("quantization_config", {})
-        quant_method = qcfg.get("quant_method", "").lower()
-        if quant_method in BYTES_PER_PARAM:
-            args.quant = quant_method
-            auto_quant = True
-        else:
-            args.quant = "bf16"
+        args.quant = config_quant or "bf16"
+        auto_quant = config_quant is not None
+
+    # A config-declared expert dtype describes the checkpoint as shipped, so
+    # honor it whenever the requested weight dtype still matches what the
+    # config says -- whether it was auto-detected or the user typed the same
+    # dtype explicitly. Suppress it only when --quant names a *different*
+    # dtype, which posits a uniform re-quantization the config no longer
+    # describes (e.g. "what would this cost in bf16").
+    config_expert_dtype = expert_dtype_of(cfg)
+    expert_dtype = (config_expert_dtype
+                    if auto_quant or args.quant == config_quant else None)
 
     auto_kv = args.kv_dtype is None
     if auto_kv:
-        args.kv_dtype = "fp8" if args.quant in ("fp8", "int4", "int3", "int2", "mxfp4") else "bf16"
+        args.kv_dtype = "fp8" if args.quant in SUB16_QUANTS else "bf16"
     result = estimate(cfg, args.quant, args.kv_dtype, args.ctx,
                       args.concurrency, args.tp, args.runtime,
-                      args.device_vram_gb, args.gpu_memory_utilization)
+                      args.device_vram_gb, args.gpu_memory_utilization,
+                      expert_dtype)
     d = result["dims"]
     params = result["params"]
     bpp = BYTES_PER_PARAM[args.quant]
@@ -777,6 +890,23 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  (auto-detected from config)")
     else:
         print()
+    if expert_dtype:
+        print(f"Expert weights:    {expert_dtype}  "
+              f"({BYTES_PER_PARAM[expert_dtype]:.2f} bytes/param)  "
+              f"(config expert_dtype; only non-expert tensors are {args.quant})")
+    elif config_expert_dtype:
+        # Quote the as-shipped figure too. Without it, a re-quantization
+        # hypothetical reads as this checkpoint's real size -- and for
+        # fp4-expert models the two differ by nearly 2x.
+        shipped, _ = calculate_mixed_precision_weights(
+            cfg, d, params, config_quant or args.quant, args.tp,
+            config_expert_dtype)
+        print(f"Expert weights:    {args.quant}  (hypothetical: config "
+              f"declares expert_dtype {config_expert_dtype}, suppressed "
+              f"because --quant {args.quant} differs)")
+        print(f"                   as shipped ({config_quant or 'config'} + "
+              f"{config_expert_dtype} experts) weights would be "
+              f"{fmt_gb(shipped)}; drop --quant for that verdict")
     if auto_kv and args.kv_dtype != "bf16":
         print(f"KV dtype:          {args.kv_dtype}  (auto-paired with --quant {args.quant}; "
               f"override with --kv-dtype)")
@@ -791,20 +921,20 @@ def main(argv: list[str] | None = None) -> int:
     if mixed_breakdown:
         print()
         print("Mixed-precision weight breakdown:")
-        if mixed_breakdown["embed_params"] > 0:
-            print(f"  Embeddings      {fmt_gb(mixed_breakdown['embed_bytes'])}   "
-                  f"({mixed_breakdown['embed_params']/1e9:.2f}B params @ {mixed_breakdown['embed_bpp']:.2f} B/p)")
-        if mixed_breakdown["attn_params"] > 0:
-            print(f"  Attention       {fmt_gb(mixed_breakdown['attn_bytes'])}   "
-                  f"({mixed_breakdown['attn_params']/1e9:.2f}B params @ {mixed_breakdown['attn_bpp']:.2f} B/p)")
-        if mixed_breakdown["router_params"] > 0:
-            print(f"  Routers         {fmt_gb(mixed_breakdown['router_bytes'])}   "
-                  f"({mixed_breakdown['router_params']/1e9:.2f}B params @ {mixed_breakdown['router_bpp']:.2f} B/p)")
-        if mixed_breakdown["ffn_params"] > 0:
-            print(f"  FFN/Experts     {fmt_gb(mixed_breakdown['ffn_bytes'])}   "
-                  f"({mixed_breakdown['ffn_params']/1e9:.2f}B params @ {mixed_breakdown['ffn_bpp']:.2f} B/p)")
-        print(f"  -----              -----")
-        print(f"  Weights total   {fmt_gb(weights)}")
+        rows = [
+            (mixed_breakdown.get("embed_label", "Embeddings"), "embed"),
+            (mixed_breakdown.get("attn_label", "Attention"), "attn"),
+            (mixed_breakdown.get("router_label", "Routers"), "router"),
+            (mixed_breakdown.get("ffn_label", "FFN/Experts"), "ffn"),
+        ]
+        for label, key in rows:
+            if mixed_breakdown[f"{key}_params"] <= 0:
+                continue
+            print(f"  {label:<15} {fmt_gb(mixed_breakdown[f'{key}_bytes'])}   "
+                  f"({mixed_breakdown[f'{key}_params']/1e9:.2f}B params @ "
+                  f"{mixed_breakdown[f'{key}_bpp']:.2f} B/p)")
+        print(f"  {'-----':<15} {'-----':>9}")
+        print(f"  {'Weights total':<15} {fmt_gb(weights)}")
 
     print()
     print("VRAM breakdown")
@@ -842,7 +972,7 @@ def main(argv: list[str] | None = None) -> int:
               f"request(s) at ctx {args.ctx}, or ctx {result['max_context']} "
               f"at concurrency {args.concurrency}  (memory-only ceiling)")
         if tp_sweep:
-            print_tp_sweep(cfg, args, tp_sweep)
+            print_tp_sweep(cfg, args, tp_sweep, expert_dtype)
         if d.is_vlm:
             print()
             print("Note: VLM runtime memory grows with image-token count, which "
@@ -881,26 +1011,34 @@ def main(argv: list[str] | None = None) -> int:
                 f"concurrency {args.concurrency} -> 1 (saves {fmt_gb(kv - new_kv)})"
             )
     if binding == "weights":
-        if args.quant in ("bf16", "fp16"):
-            for q in ("fp8", "int4", "int3"):
-                new_w = int(params * BYTES_PER_PARAM[q] / args.tp)
+        # Price candidate quants through the same mixed-precision path as the
+        # verdict, so "saves" cannot contradict the weights line above.
+        for q in ("fp8", "int4", "int3"):
+            if BYTES_PER_PARAM[q] >= BYTES_PER_PARAM[args.quant]:
+                continue
+            new_w, _ = calculate_mixed_precision_weights(
+                cfg, d, params, q, args.tp, expert_dtype)
+            if new_w < weights:
                 suggestions.append(
                     f"quant {args.quant} -> {q} (saves {fmt_gb(weights - new_w)})"
                 )
-        if args.tp == 1:
-            suggestions.append(
-                f"--tp 2 splits weights across two XPUs (saves {fmt_gb(weights // 2)})"
-            )
+        # More XPUs always helps a weights-bound fit, at any starting TP --
+        # an already-sharded run needs "go wider", not "give up".
+        next_tp = args.tp * 2
+        suggestions.append(
+            f"--tp {next_tp} splits weights across {next_tp} XPUs "
+            f"(saves {fmt_gb(weights - weights // 2)})"
+        )
     if not suggestions:
         suggestions.append(
             "model is too big for this device at any reasonable setting; "
             "try a smaller model or more XPUs (--tp)"
         )
     # Always show the TP option for weights-bound cases, even past the cap.
-    cap = 4 if (binding == "weights" and args.tp == 1) else 3
+    cap = len(suggestions) if binding == "weights" else 3
     print(f"  Try first: {' or '.join(suggestions[:cap])}")
     if tp_sweep:
-        print_tp_sweep(cfg, args, tp_sweep)
+        print_tp_sweep(cfg, args, tp_sweep, expert_dtype)
     return 1
 
 

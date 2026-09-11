@@ -53,6 +53,22 @@ throughput may differ from the estimate.
 `int3` and `int2` are AutoRound-oriented planning modes. Validate output
 quality before trusting a deployment based on those sizes.
 
+For `fp4` weights -- NVFP4 checkpoints, or MoE models whose config sets
+`expert_dtype: fp4` such as DeepSeek-V4-Flash -- the memory estimate is
+only half the question. Battlemage has no native fp4 datapath, so whether
+those bytes stay 4-bit on device depends on the runtime's kernel support.
+If the runtime upcasts expert weights to fp8 or bf16 at load, real weight
+memory is 2x or 4x the estimate and a tight multi-XPU fit fails at engine
+init. Say so on any fp4 verdict, and confirm the architecture is
+registered before calling it deployable:
+
+```sh
+python3 -c "from vllm.model_executor.models.registry import ModelRegistry as M; \
+print([a for a in M.get_supported_archs() if 'eepseek' in a])"
+```
+
+A FITS verdict for an fp4 model is a claim about bytes, not about kernels.
+
 ## VLM Caveats
 
 The script includes the vision tower weights when `vision_config`,
